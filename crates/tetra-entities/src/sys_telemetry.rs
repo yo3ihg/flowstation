@@ -377,6 +377,44 @@ fn scan_nvme_temps(out: &mut Vec<SysSensor>) {
 // Generic thermal zones (fallback for ARM SoCs without hwmon temp entries)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Best-effort primary host temperature in °C, for the U-STATUS info responder. Scans the kernel
+/// thermal zones and prefers a CPU/SoC/package zone, falling back to the hottest reading. Returns
+/// `None` where no thermal zones exist (e.g. a macOS dev host).
+pub fn cpu_temp_c() -> Option<f32> {
+    let dir = fs::read_dir("/sys/class/thermal").ok()?;
+    let mut readings: Vec<(String, f32)> = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("thermal_zone") {
+            continue;
+        }
+        let path = entry.path();
+        if let Some(millideg) = read_int_file(&path.join("temp")) {
+            let kind = read_string_file(&path.join("type")).unwrap_or_default().to_lowercase();
+            readings.push((kind, millideg as f32 / 1000.0));
+        }
+    }
+    readings
+        .iter()
+        .find(|(k, _)| k.contains("cpu") || k.contains("soc") || k.contains("pkg") || k.contains("x86"))
+        .map(|(_, t)| *t)
+        .or_else(|| readings.iter().map(|(_, t)| *t).fold(None, |m, t| Some(m.map_or(t, |x: f32| x.max(t)))))
+}
+
+/// Best-effort primary (outbound) host IPv4 address, for the U-STATUS info responder. Uses the
+/// connect-a-UDP-socket trick: no packet is sent, the kernel just resolves which local interface
+/// would route to a public address — which is the hotspot/LAN address the operator wants. Returns
+/// `None` when there is no usable route.
+pub fn primary_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
 fn scan_thermal_zones(out: &mut Vec<SysSensor>) {
     let Ok(dir) = fs::read_dir("/sys/class/thermal") else { return; };
     for entry in dir.flatten() {

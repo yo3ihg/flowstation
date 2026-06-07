@@ -89,6 +89,34 @@ body{
 .logo-text .logo-sub{font-size:10px;color:var(--text3);letter-spacing:0.08em;font-family:var(--mono);}
 #sidebar.collapsed .logo-text{opacity:0;width:0;pointer-events:none;}
 
+/* ── Update-available badge (own block under the logo, not clipped by the logo box) ── */
+.update-badge{
+  display:none;
+  margin:6px 12px 2px;
+  padding:8px 11px;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#fff;
+  border-radius:8px;
+  font-size:11px;font-weight:700;line-height:1.35;letter-spacing:0.01em;
+  cursor:pointer;text-align:left;white-space:normal;word-break:break-word;
+  box-shadow:0 2px 8px rgba(0,0,0,0.28);
+  transition:filter 0.15s ease, transform 0.15s ease;
+}
+.update-badge:hover{filter:brightness(1.08);transform:translateY(-1px);}
+#sidebar.collapsed .update-badge{display:none!important;}
+
+/* ── Callsign (indicativ) shown next to an ISSI ── */
+.callsign{
+  display:inline-block;
+  margin-left:6px;
+  padding:1px 6px;
+  border-radius:4px;
+  background:var(--accent-soft,rgba(120,170,255,0.14));
+  color:var(--accent2);
+  font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:0.02em;
+  vertical-align:middle;
+}
+
 .sidebar-nav{
   flex:1;padding:8px 8px;overflow-y:auto;overflow-x:hidden;
 }
@@ -1038,6 +1066,58 @@ td code{
   0%{box-shadow:0 0 6px rgba(255,60,80,0.6);}
   100%{box-shadow:0 0 14px rgba(255,60,80,1);}
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Polish layer — additive motion + gloss on top of the base design (kept).
+   Aesthetic only; layout unchanged. All motion is gated behind
+   prefers-reduced-motion so it respects accessibility / low-power hosts.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Glossy top sheen on the KPI cards — a faint specular highlight, no motion. */
+.stat-card::after{
+  content:'';position:absolute;inset:0;border-radius:inherit;pointer-events:none;
+  background:linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0) 34%);
+  mix-blend-mode:soft-light;
+}
+.card{position:relative;}
+
+/* Smooth focus ring on form inputs (Apple-style). */
+.form-input{transition:border-color .15s ease, box-shadow .15s ease;}
+.form-input:focus{
+  outline:none;border-color:var(--accent2);
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--accent2) 22%, transparent);
+}
+/* Smooth table-row hover. */
+tbody td{transition:background .12s ease;}
+
+@media (prefers-reduced-motion: no-preference){
+  /* Cards & KPI cards: gentle hover lift with a deeper, softer shadow. */
+  .card,.stat-card{
+    transition:transform .24s cubic-bezier(.2,.7,.3,1), box-shadow .24s ease, border-color .24s ease;
+  }
+  .card:hover,.stat-card:hover{
+    transform:translateY(-2px);
+    box-shadow:0 12px 30px -12px rgba(0,0,0,0.55), 0 2px 8px rgba(0,0,0,0.30);
+    border-color:var(--border2);
+  }
+  /* Page enter: fade + rise. Fires only when a page becomes active (nav switch). */
+  .page.active{animation:fsPageIn .34s cubic-bezier(.2,.7,.3,1) both;}
+  @keyframes fsPageIn{from{opacity:0;transform:translateY(7px);}to{opacity:1;transform:none;}}
+  /* Nav items: smoother hover/active transition. */
+  .nav-item{transition:background .18s ease, color .18s ease, box-shadow .18s ease;}
+  /* Buttons: tactile press + smoother hover. */
+  .btn{transition:all .15s ease, transform .08s ease;}
+  .btn:active{transform:scale(.96);}
+  /* Update-available badge: gentle attention glow. */
+  .update-badge{animation:fsGlow 2.4s ease-in-out infinite;}
+  @keyframes fsGlow{
+    0%,100%{box-shadow:0 2px 8px rgba(0,0,0,0.28);}
+    50%{box-shadow:0 2px 8px rgba(0,0,0,0.28), 0 0 18px -2px var(--accent);}
+  }
+}
+
+/* Refined, rounded scrollbar thumbs everywhere (no size change → no conflicts). */
+::-webkit-scrollbar-thumb{border-radius:6px;}
 </style>
 </head>
 <body>
@@ -1052,12 +1132,11 @@ td code{
     <div class="logo-text">
       <div class="logo-name">FlowStation</div>
       <div class="logo-sub">{{STACK_VERSION}}</div>
-      <div id="update-badge" onclick="showPage('config',document.getElementById('nav-config'))"
-           style="display:none;cursor:pointer;margin-top:4px;font-size:11px;font-weight:700;
-                  color:#fff;background:var(--accent);border-radius:4px;padding:2px 8px"
-           title="Click to update"></div>
     </div>
   </div>
+  <div id="update-badge" class="update-badge"
+       onclick="showPage('config',document.getElementById('nav-config'))"
+       title="Click to update"></div>
 
   <div class="sidebar-nav">
     <div class="nav-section-label" data-i18n-section="monitor">MONITOR</div>
@@ -2679,6 +2758,32 @@ function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/'/g,"&#39;"
 
 // ── State + WS ────────────────────────────────────────────────────────────
 let ws=null,state={ms:{},calls:{},lastHeard:[],brewOnline:false,brewVer:0},sdsDest=0;
+
+// ── RadioID callsigns (indicativ) ──────────────────────────────────────────────
+// issi -> "CALLSIGN" (found) | "" (looked up, none). A missing key means unresolved.
+let callsigns={};
+let _csInflight=false;
+// Render an ISSI with its RadioID callsign appended, when known.
+function idCell(issi){const cs=callsigns[issi];return cs?`<code>${issi}</code> <span class="callsign">${cs}</span>`:`<code>${issi}</code>`;}
+// Resolve callsigns for every ISSI currently on screen we have not looked up yet. On-demand: the
+// server fetches unknowns from RadioID in the background and caches them locally; pending IDs are
+// omitted from the response and retried on the next tick. Found/absent results are cached here.
+function refreshCallsigns(){
+  if(_csInflight)return;
+  const ids=new Set();
+  Object.values(state.ms).forEach(m=>ids.add(m.issi));
+  Object.values(state.calls).forEach(c=>{if(c.caller_issi)ids.add(c.caller_issi);if(c.called_issi&&c.call_type!=='group')ids.add(c.called_issi);if(c.active_speaker)ids.add(c.active_speaker);});
+  state.lastHeard.forEach(e=>{if(e.issi)ids.add(e.issi);});
+  const unknown=[...ids].filter(id=>id&&callsigns[id]===undefined).slice(0,256);
+  if(!unknown.length)return;
+  _csInflight=true;
+  fetch('/api/callsigns?ids='+unknown.join(','))
+    .then(r=>r.ok?r.json():{})
+    .then(d=>{let changed=false;for(const k in d){if(callsigns[k]!==d[k]){callsigns[k]=d[k];changed=true;}}if(changed){renderStations();renderCalls();renderLastHeard();}})
+    .catch(()=>{})
+    .finally(()=>{_csInflight=false;});
+}
+setInterval(refreshCallsigns,4000);
 const logFilter=()=>document.getElementById('log-filter').value;
 
 function showFallbackBanner(reason){
@@ -2759,7 +2864,7 @@ function handleMsg(msg){
       if(msg.last_tx_quality){handleTxQuality(msg.last_tx_quality);}
       if(msg.last_sdr_health){handleSdrHealth(msg.last_sdr_health);}
       if(msg.last_sys_health){handleSysHealth(msg.last_sys_health);}
-      renderAll();break;
+      renderAll();refreshCallsigns();break;
     case 'brew_status':
       setBrewStatus(!!msg.connected,msg.brew_version||0);break;
     case 'ms_registered':
@@ -3015,7 +3120,7 @@ function renderStations(){
     }
     const ls=m._last_seen_ts?Math.floor((Date.now()-m._last_seen_ts)/1000):m.last_seen_secs_ago;
     return`<tr>
-      <td><code>${m.issi}</code></td><td>${grps}</td>
+      <td>${idCell(m.issi)}</td><td>${grps}</td>
       <td class="col-mobile-hide" style="text-align:center">${eeLabel(m.energy_saving_mode||0)}</td>
       <td><div class="rssi-bar"><div class="rssi-track"><div class="rssi-fill" style="width:${pct}%;background:${col}"></div></div><span class="rssi-val" style="color:${col}">${rL}</span></div></td>
       <td><span class="badge badge-green">${t('online_badge')}</span></td>
@@ -3034,9 +3139,9 @@ function renderCalls(){
     const mm=String(Math.floor(dur/60)).padStart(2,'0'),ss=String(dur%60).padStart(2,'0');
     const badge=c.call_type==='group'?'badge-blue':'badge-yellow';
     const label=c.call_type==='group'?t('call_group'):(c.simplex?t('call_p2p_s'):t('call_p2p_d'));
-    const to=c.call_type==='group'?`GSSI ${c.gssi}`:`ISSI ${c.called_issi}`;
-    const spk=c.active_speaker?`<code>${c.active_speaker}</code>`:'<span style="color:var(--text3)">—</span>';
-    return`<tr><td class="col-mobile-hide"><code>${c.call_id}</code></td><td><span class="badge ${badge}">${label}</span></td><td>${c.caller_issi?`<code>${c.caller_issi}</code>`:'—'}</td><td>${to}</td><td>${spk}</td><td style="font-family:var(--mono);font-size:12px;color:var(--accent2);font-weight:600">${mm}:${ss}</td></tr>`;
+    const to=c.call_type==='group'?`GSSI ${c.gssi}`:idCell(c.called_issi);
+    const spk=c.active_speaker?idCell(c.active_speaker):'<span style="color:var(--text3)">—</span>';
+    return`<tr><td class="col-mobile-hide"><code>${c.call_id}</code></td><td><span class="badge ${badge}">${label}</span></td><td>${c.caller_issi?idCell(c.caller_issi):'—'}</td><td>${to}</td><td>${spk}</td><td style="font-family:var(--mono);font-size:12px;color:var(--accent2);font-weight:600">${mm}:${ss}</td></tr>`;
   }).join('');
 }
 
@@ -3047,7 +3152,7 @@ function renderLastHeard(){
   tb.innerHTML=state.lastHeard.map(e=>{
     const destStr=e.dest?`<code>${e.dest}</code>`:'<span style="color:var(--text3)">—</span>';
     const isOnline=!!state.ms[e.issi];
-    const issiHtml=`<code>${e.issi}</code>${isOnline?` <span class="badge badge-green" style="font-size:9px">${t('online_badge')}</span>`:''}`;
+    const issiHtml=`${idCell(e.issi)}${isOnline?` <span class="badge badge-green" style="font-size:9px">${t('online_badge')}</span>`:''}`;
     return`<tr>
       <td style="font-family:var(--mono);font-size:11px;color:var(--text2)">${e.ts}</td>
       <td>${issiHtml}</td><td>${activityBadge(e.activity)}</td><td>${destStr}</td>
@@ -4101,7 +4206,7 @@ async function checkUpdate(){
     const badge=document.getElementById('update-badge');
     const btn=document.getElementById('update-btn');
     if(d&&d.update_available&&d.latest){
-      if(badge){badge.style.display='inline-block';badge.textContent='⬆ '+t('update_available')+' '+d.latest;}
+      if(badge){badge.style.display='block';badge.textContent='⬆ '+t('update_available')+' '+d.latest;}
       if(btn){btn.classList.add('btn-primary');btn.textContent='⬆ '+t('update')+' → '+d.latest;}
     }else{
       if(badge)badge.style.display='none';

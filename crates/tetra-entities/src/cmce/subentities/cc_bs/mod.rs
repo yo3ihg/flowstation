@@ -68,8 +68,8 @@ mod echo;
 use echo::EchoSession;
 
 use call::{
-    ActiveCall, CallOrigin, GroupCallState, IndividualCall, IndividualCallState,
-    TxDemandQueueResult,
+    ActiveCall, CallOrigin, EE_DSETUP_FALLBACK_TS, GroupCallState, IndividualCall,
+    IndividualCallState, TxDemandQueueResult,
 };
 use fsm::{GroupTransitionError, IndividualTransitionError};
 

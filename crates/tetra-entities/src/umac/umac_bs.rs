@@ -30,6 +30,7 @@ use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::scrambler;
+use crate::umac::subcomp::bs_frag::BsFragger;
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
@@ -621,7 +622,9 @@ impl UmacBs {
                 pdu
             }
             Err(e) => {
-                tracing::warn!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
+                // A candidate UL burst that isn't a valid MAC-ACCESS — typically a false-positive
+                // training-sequence detection or a noise-corrupted burst. Dropped; normal on RF.
+                tracing::debug!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
                 return;
             }
         };
@@ -810,7 +813,7 @@ impl UmacBs {
         // Get slot owner from schedule
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
-            tracing::warn!("rx_mac_frag_ul: Received MAC-FRAG-UL for unassigned block {:?}", prim.block_num);
+            tracing::debug!("rx_mac_frag_ul: MAC-FRAG-UL for unassigned block {:?} (start not seen — normal on RF loss)", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
@@ -888,7 +891,7 @@ impl UmacBs {
         // Insert last fragment and retrieve finalized block
         let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
         let Some(defragbuf) = defragbuf else {
-            tracing::warn!("rx_mac_end_ul: could not obtain defragged buf");
+            tracing::debug!("rx_mac_end_ul: could not obtain defragged buf (start not seen — normal on RF loss)");
             return;
         };
 
@@ -994,7 +997,7 @@ impl UmacBs {
         // Get slot owner from schedule, decrypt if needed
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
-            tracing::warn!("rx_mac_end_hu: Received MAC-END-HU for unassigned block {:?}", prim.block_num);
+            tracing::debug!("rx_mac_end_hu: MAC-END-HU for unassigned block {:?} (start not seen — normal on RF loss)", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
@@ -1005,7 +1008,7 @@ impl UmacBs {
         // Insert last fragment and retrieve finalized block
         let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
         let Some(defragbuf) = defragbuf else {
-            tracing::warn!("rx_mac_end_hu: could not obtain defragged buf");
+            tracing::debug!("rx_mac_end_hu: could not obtain defragged buf (start not seen — normal on RF loss)");
             return;
         };
 
@@ -1171,7 +1174,7 @@ impl UmacBs {
                     let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
                     let has_pending_ra = self.channel_scheduler.take_pending_ra_ack(ts, prim.main_address.ssi);
                     let is_random_access_response = has_pending_ra || prim.main_address.ssi_type == SsiType::Issi;
-                    let mut mac_pdu = MacResource {
+                    let mac_pdu = MacResource {
                         fill_bits: false,
                         pos_of_grant: 0,
                         encryption_mode: 0,
@@ -1184,23 +1187,49 @@ impl UmacBs {
                         slot_granting_element: None,
                         chan_alloc_element: None,
                     };
-                    mac_pdu.update_len_and_fill_ind(sdu.get_len());
-
-                    let mut stch_block = BitBuffer::new(STCH_CAP);
-                    mac_pdu.to_bitbuf(&mut stch_block);
 
                     sdu.seek(0);
                     let sdu_len = sdu.get_len();
-                    stch_block.copy_bits(&mut sdu, sdu_len);
+                    let hdr_len = mac_pdu.compute_header_len();
 
-                    tracing::info!(
-                        "rx_ul_tma_unitdata_req: FACCH stealing on ts {} (MAC-RESOURCE + {} SDU bits → {} STCH bits)",
-                        ts,
-                        sdu_len,
-                        stch_block.get_len()
-                    );
+                    if hdr_len + sdu_len <= STCH_CAP {
+                        // Fits in a single stolen half-slot — one STCH block (unchanged path,
+                        // used by small control PDUs and short status/SDS messages).
+                        let mut mac_pdu = mac_pdu;
+                        mac_pdu.update_len_and_fill_ind(sdu_len);
 
-                    self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                        let mut stch_block = BitBuffer::new(STCH_CAP);
+                        mac_pdu.to_bitbuf(&mut stch_block);
+                        sdu.seek(0);
+                        stch_block.copy_bits(&mut sdu, sdu_len);
+
+                        tracing::info!(
+                            "rx_ul_tma_unitdata_req: FACCH stealing on ts {} (MAC-RESOURCE + {} SDU bits → {} STCH bits)",
+                            ts,
+                            sdu_len,
+                            stch_block.get_len()
+                        );
+
+                        self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                    } else {
+                        // Larger than one stolen half-slot: fragment across consecutive stolen
+                        // half-slots (panic-safe — a fixed 124-bit buffer used to overflow here and
+                        // crash the stack). Individual in-call SDS no longer reach this path: the
+                        // field radios do not accept an SDS in-band on the traffic channel, so CMCE
+                        // defers them to the MCCH (see sds_bs PendingSds). This path now only covers
+                        // the rare oversized group/other stealing PDU. (FH-BUG-034.)
+                        let mut fragger = BsFragger::new(mac_pdu, sdu, prim.tx_reporter);
+                        let mut produced = 0usize;
+                        loop {
+                            let mut stch_block = BitBuffer::new(STCH_CAP);
+                            let done = fragger.get_next_chunk(&mut stch_block);
+                            self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, None);
+                            produced += 1;
+                            if done || produced >= 32 {
+                                break;
+                            }
+                        }
+                    }
 
                     return;
                 } // end circuit_is_active guard

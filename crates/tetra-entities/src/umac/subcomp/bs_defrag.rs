@@ -83,7 +83,7 @@ impl BsDefrag {
         let buf = match self.buffers[ts].get_mut(&ssi) {
             Some(b) => b,
             None => {
-                tracing::warn!("defrag_buffer for ts {} ssi {} not found", t.t, ssi);
+                tracing::debug!("defrag_buffer for ts {} ssi {} not found (start burst not seen — normal on RF loss)", t.t, ssi);
                 return;
             }
         };
@@ -126,7 +126,7 @@ impl BsDefrag {
         let mut buf = match self.buffers[ts].remove(&ssi) {
             Some(b) => b,
             None => {
-                tracing::warn!("defrag_buffer for ts {} ssi {} not found", t.t, ssi);
+                tracing::debug!("defrag_buffer for ts {} ssi {} not found (start burst not seen — normal on RF loss)", t.t, ssi);
                 return None;
             }
         };
@@ -143,7 +143,7 @@ impl BsDefrag {
         let buf = match self.buffers[ts].get(&ssi) {
             Some(b) => b,
             None => {
-                tracing::warn!("defrag_buffer for ts {} ssi {} not found", t.t, ssi);
+                tracing::debug!("defrag_buffer for ts {} ssi {} not found (start burst not seen — normal on RF loss)", t.t, ssi);
                 return None;
             }
         };

@@ -24,8 +24,9 @@ pub struct MmClientProperties {
     pub state: MmClientState,
     pub groups: HashSet<u32>,
     pub energy_saving_mode: EnergySavingMode,
-    /// TDMA frame number (0-17) at which this MS wakes up to monitor MCCH.
-    /// Set to None for StayAlive MSs. Used by CMCE to schedule DSetup retransmissions.
+    /// TDMA frame number (1..=18) at which this MS wakes up to monitor the MCCH.
+    /// Set to None for StayAlive MSs. Used to gate/schedule unsolicited downlink (D-SETUP, SDS)
+    /// to the MS's energy-economy monitoring window.
     pub monitoring_frame: Option<u8>,
     /// Multiframe offset within the Eg cycle at which this MS wakes up.
     /// Set to None for StayAlive MSs.
@@ -269,6 +270,27 @@ impl MmClientMgr {
             .values()
             .filter(|c| c.last_handle != 0)
             .map(|c| (c.issi, c.last_handle))
+    }
+
+    /// Per-MS energy-economy monitoring windows, for publishing into shared state so the downlink
+    /// scheduler can defer unsolicited traffic to a sleeping MS's wake window. Yields
+    /// (issi, monitoring_frame, monitoring_multiframe, cycle_len) for every client that is actually
+    /// in an energy-saving mode (not StayAlive) and has a valid monitoring window. StayAlive MSs are
+    /// omitted (their absence means "always reachable"). cycle_len = (Eg mode as u8) + 1 (Eg1=2…).
+    pub fn ee_monitoring_windows(&self) -> impl Iterator<Item = (u32, u8, u8, u8)> + '_ {
+        self.clients.values().filter_map(|c| {
+            if c.energy_saving_mode == EnergySavingMode::StayAlive {
+                return None;
+            }
+            let frame = c.monitoring_frame?;
+            let mframe = c.monitoring_multiframe?;
+            let cycle_len = (c.energy_saving_mode as u8).saturating_add(1);
+            // Guard against a malformed window so the scheduler never gates on garbage.
+            if cycle_len < 2 || !(1..=18).contains(&frame) {
+                return None;
+            }
+            Some((c.issi, frame, mframe, cycle_len))
+        })
     }
 
     /// Update the last known L2 handle for a registered client.

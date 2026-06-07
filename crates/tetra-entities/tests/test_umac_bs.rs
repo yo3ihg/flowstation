@@ -1,10 +1,17 @@
 mod common;
 
+use tetra_core::Direction;
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
@@ -169,4 +176,79 @@ fn test_out_fragmented_resource() {
     test.run_stack(Some(8));
 
     tracing::info!("Validation of result not implemented");
+}
+
+/// FH-BUG-034 follow-up regression: a stealing TmaUnitdataReq whose MAC-RESOURCE + SDU does
+/// not fit in one 124-bit STCH half-slot must be fragmented across consecutive stolen
+/// half-slots — NOT written into a fixed 124-bit buffer, which panicked the whole stack
+/// ("write would exceed buffer end") and was a remotely-triggerable crash: sending an SDS or
+/// status longer than one half-slot to an MS engaged in a call took down the BS.
+///
+/// This test drives the exact UMAC path (rx_ul_tma_unitdata_req) with a large stealing SDU on
+/// an open traffic circuit and asserts the run completes without panicking.
+#[test]
+fn test_stealing_large_sdu_fragments_without_panic() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let components = vec![TetraEntity::Umac];
+    let sinks: Vec<TetraEntity> = vec![TetraEntity::Lmac];
+    test.populate_entities(components, sinks);
+
+    let ts = 2u8;
+    let dest = TetraAddress { ssi: 2260575, ssi_type: SsiType::Issi };
+
+    // Open a DL+UL traffic circuit on ts 2 so the stealing path has an active circuit to steal
+    // a half-slot from (otherwise it falls back to the MCCH and the bug isn't exercised).
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 6,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalLoopback,
+        })),
+    });
+    test.run_stack(Some(1));
+
+    // A ~240-bit SDU: far larger than one 124-bit STCH half-slot, forcing fragmentation.
+    let big_sdu = "0".repeat(120) + &"1".repeat(120);
+    let tma = TmaUnitdataReq {
+        req_handle: 0,
+        pdu: BitBuffer::from_bitstr(&big_sdu),
+        main_address: dest,
+        endpoint_id: 0,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(6),
+            carrier: None,
+            timeslots: [false, true, false, false], // ts 2
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Dl,
+        }),
+        tx_reporter: None,
+    };
+
+    // Before the fix this call panicked inside the UMAC stealing builder. The assertion is
+    // simply that we get here and can keep running ticks — i.e. no panic, the stack survives.
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(tma),
+    });
+    test.run_stack(Some(8));
+
+    tracing::info!("stealing large SDU fragmented across STCH half-slots without panic");
 }

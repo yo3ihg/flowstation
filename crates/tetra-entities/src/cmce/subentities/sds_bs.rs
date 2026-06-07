@@ -30,6 +30,40 @@ pub enum SdsPendingAction {
     KickAll,
 }
 
+/// An individual D-SDS-DATA whose delivery is deferred because the destination MS is currently
+/// engaged in a call (camped on a traffic timeslot, not the MCCH). It is delivered on the MCCH —
+/// the normal, reliable idle-MS path — as soon as the destination leaves the call.
+///
+/// We do NOT attempt in-band delivery on the traffic channel. That was tried exhaustively against
+/// the field radios (FACCH stealing with MAC fragmentation across half-slots, single-block STCH,
+/// and a full-slot SCH/F in the hangtime gap). The BS transmits all of them per ETSI, but the
+/// field terminals never received any of them — they only accept an SDS on the MCCH. So the SDS is
+/// held until the call releases and then delivered on the MCCH, which is acknowledged end-to-end
+/// (verified on-air). (FH-BUG-034.)
+#[derive(Debug, Clone)]
+pub struct PendingSds {
+    pub source_issi: u32,
+    pub dest_ssi: u32,
+    pub user_defined_data: SdsUserData,
+    pub queued_at: std::time::Instant,
+}
+
+/// Single bounded deadline an SDS may sit deferred — destination in a call, or an EE MS asleep
+/// outside its monitoring window — before we GIVE UP and report failure to the sender instead of
+/// delivering it. Kept deliberately short, below the field terminals' own SDS delivery-report
+/// timeout, so the outcome is never "failed then delivered" minutes later (FH-BUG-036): within the
+/// deadline we deliver as soon as the destination is reachable; past it we fail cleanly. A normal
+/// short call or EE window resolves well within this; a long (back-to-back) call makes the SDS fail
+/// rather than arrive long after the sender's radio already declared it undelivered.
+const SDS_DEFER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// SDS-TL delivery-report "delivery status" octet signalling a negative outcome (could not be
+/// delivered), sent to the originator when we give up on a deferred SDS. NOTE: confirm on-air that
+/// the field terminals (Motorola MXP600/MTP6750) render this as "not delivered" — it is
+/// codeplug-dependent. If a radio ignores it, it still falls back to its own delivery-report
+/// timeout (also "failed"), and we never deliver the message late, so the two cannot contradict.
+const SDS_TL_STATUS_UNDELIVERABLE: u8 = 0x02;
+
 pub struct SdsBsSubentity {
     config: SharedConfig,
     telemetry: Option<TelemetrySink>,
@@ -37,6 +71,11 @@ pub struct SdsBsSubentity {
     sds_broadcast_sender: HomeModeDisplaySender,
     live_sds_sender: HomeModeDisplaySender,
     pub pending_actions: Vec<SdsPendingAction>,
+    /// Individual SDS deferred until their destination is reachable (out of a call AND awake on its
+    /// energy-economy monitoring window). See PendingSds / flush_pending_sds.
+    pending_sds: Vec<PendingSds>,
+    /// Most recent downlink TdmaTime, set each tick. Used to evaluate the EE monitoring-window gate.
+    last_dltime: TdmaTime,
     /// Control-command sender used to re-inject WX/METAR replies into the stack from the
     /// background fetch thread. Cloned from the CMCE command dispatcher at startup. When
     /// None (no control links), the WX responder still works for nothing — replies need
@@ -55,6 +94,8 @@ impl SdsBsSubentity {
             sds_broadcast_sender: HomeModeDisplaySender::new(),
             live_sds_sender: HomeModeDisplaySender::new(),
             pending_actions: Vec::new(),
+            pending_sds: Vec::new(),
+            last_dltime: TdmaTime::default(),
             wx_cmd_tx: None,
             last_periodic_wx: None,
         }
@@ -82,8 +123,91 @@ impl SdsBsSubentity {
         }
     }
 
+    /// True if `dest_ssi` (an individual ISSI) is currently on one of our traffic timeslots —
+    /// either directly (active talker / individual-call party) or as an affiliated member of an
+    /// active group call. Such an MS follows the FACCH on its traffic slot, not the MCCH.
+    fn issi_on_local_traffic(&self, dest_ssi: u32) -> bool {
+        let state = self.config.state_read();
+        state.active_call_ts.contains_key(&dest_ssi)
+            || state
+                .subscribers
+                .attached_groups_of(dest_ssi)
+                .into_iter()
+                .any(|gssi| state.active_call_ts.contains_key(&gssi))
+    }
+
+    /// True if `dest_ssi` is an energy-economy MS that is NOT currently awake on its downlink
+    /// monitoring window (so an unsolicited SDS sent now would be missed — defer it to the window).
+    /// Returns false for StayAlive / unknown MSs (absent from the published map) and whenever the
+    /// window is open, i.e. those are delivered immediately. (ETSI EN 300 392-2 §16.7.)
+    fn ee_window_blocks(&self, dest_ssi: u32) -> bool {
+        let state = self.config.state_read();
+        match state.ee_monitoring_windows.get(&dest_ssi) {
+            Some(&(frame, mframe, cycle_len)) => {
+                !self.last_dltime.in_ee_monitoring_window(frame, mframe, cycle_len)
+            }
+            None => false, // not in energy economy — always reachable
+        }
+    }
+
+    /// Deliver deferred SDS whose destination is now reachable, or fail them. An SDS is deferred
+    /// while its destination is in a call (delivered on the MCCH once it returns) OR is an
+    /// energy-economy MS asleep outside its monitoring window (delivered when the window opens).
+    /// Called every tick. A single short deadline (`SDS_DEFER_DEADLINE`) keeps the outcome
+    /// consistent with what the sending radio sees: within the deadline we deliver as soon as the
+    /// destination is reachable; past it we GIVE UP and report failure to the originator rather than
+    /// delivering minutes late — which would surface as "failed then delivered" once the sender's
+    /// own delivery-report timer had already expired (FH-BUG-036).
+    fn flush_pending_sds(&mut self, queue: &mut MessageQueue) {
+        if self.pending_sds.is_empty() {
+            return;
+        }
+        for p in std::mem::take(&mut self.pending_sds) {
+            let reachable =
+                !self.issi_on_local_traffic(p.dest_ssi) && !self.ee_window_blocks(p.dest_ssi);
+            if reachable {
+                // Out of any call and awake on its window (if in EE) — deliver on the MCCH.
+                tracing::info!("SDS: destination {} reachable — delivering deferred SDS on the MCCH", p.dest_ssi);
+                self.deliver_d_sds_data_now(queue, p.source_issi, p.dest_ssi, SsiType::Issi, p.user_defined_data);
+            } else if p.queued_at.elapsed() > SDS_DEFER_DEADLINE {
+                // Could not reach the destination within the deadline — fail cleanly and tell the
+                // sender, instead of delivering late after its radio has already given up.
+                tracing::warn!(
+                    "SDS: {} -> {} undeliverable within {}s (destination stayed in a call / asleep) — failing",
+                    p.source_issi, p.dest_ssi, SDS_DEFER_DEADLINE.as_secs()
+                );
+                self.report_sds_failure(queue, &p);
+            } else {
+                self.pending_sds.push(p); // still unreachable — keep waiting until the deadline
+            }
+        }
+    }
+
+    /// Send an SDS-TL delivery report with a failure status back to the originator of a deferred SDS
+    /// we are giving up on, so its terminal shows "not delivered" promptly and definitively — and is
+    /// never contradicted by a late delivery, since the message is dropped here. Only emitted when
+    /// the original was an SDS-TL message carrying a message reference (status-only / non-TL SDS have
+    /// nothing to report against, and an SDS-TL report itself has no reference, so this never loops).
+    fn report_sds_failure(&mut self, queue: &mut MessageQueue, p: &PendingSds) {
+        let Some(mr) = Self::sds_tl_message_reference(&p.user_defined_data) else {
+            return;
+        };
+        // SDS-TL SHORT REPORT: [PID 0x82, type 0x10 (report), delivery status, message reference],
+        // addressed FROM the unreachable destination TO the original sender. Sent immediately on the
+        // MCCH (not deferred) — if the sender is itself busy it falls back to its own timeout.
+        let report = SdsUserData::Type4(32, vec![0x82, 0x10, SDS_TL_STATUS_UNDELIVERABLE, mr]);
+        tracing::info!(
+            "SDS: reporting delivery failure to {} (MR={}) for undeliverable SDS to {}",
+            p.source_issi, mr, p.dest_ssi
+        );
+        self.deliver_d_sds_data_now(queue, p.dest_ssi, p.source_issi, SsiType::Issi, report);
+    }
+
     /// Called every tick from CmceBs::tick_start. Fires Home Mode Display broadcast when due.
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
+        self.last_dltime = dltime; // record current time for the EE monitoring-window gate
+        // Flush SDS that were deferred while their destination was in a call or asleep (EE).
+        self.flush_pending_sds(queue);
         if let Some(hmd_tx) = self.home_mode_display_sender.tick_start(&self.config, dltime) {
             self.send_d_sds_data(queue, hmd_tx.source_issi, hmd_tx.dest_gssi, SsiType::Gssi, hmd_tx.payload);
         }
@@ -662,9 +786,44 @@ impl SdsBsSubentity {
             .ok();
     }
 
-    /// Build and send a D-SDS-DATA PDU to a local MS
+    /// Build and send a D-SDS-DATA PDU to a local MS.
+    ///
+    /// For an INDIVIDUAL destination that is currently unreachable on the MCCH — engaged in a call,
+    /// or an energy-economy MS asleep outside its monitoring window — the SDS is DEFERRED and
+    /// delivered when the destination is reachable again (see PendingSds / flush_pending_sds). The
+    /// field radios do not accept an SDS in-band on the traffic channel, and an EE MS only listens
+    /// on its monitoring window. All other cases (reachable ISSI, group/GSSI) are sent immediately.
     fn send_d_sds_data(
-        &self,
+        &mut self,
+        queue: &mut MessageQueue,
+        source_issi: u32,
+        dest_ssi: u32,
+        dest_ssi_type: SsiType,
+        user_defined_data: SdsUserData,
+    ) {
+        if dest_ssi_type == SsiType::Issi
+            && (self.issi_on_local_traffic(dest_ssi) || self.ee_window_blocks(dest_ssi))
+        {
+            tracing::info!(
+                "SDS: dest {} not reachable on MCCH now (in call or EE-asleep) — deferring until reachable",
+                dest_ssi
+            );
+            self.pending_sds.push(PendingSds {
+                source_issi,
+                dest_ssi,
+                user_defined_data,
+                queued_at: std::time::Instant::now(),
+            });
+            return;
+        }
+
+        self.deliver_d_sds_data_now(queue, source_issi, dest_ssi, dest_ssi_type, user_defined_data);
+    }
+
+    /// Build and send a D-SDS-DATA immediately (no reachability gating). Used for the direct path
+    /// and for flushing deferred SDS once the destination is reachable.
+    fn deliver_d_sds_data_now(
+        &mut self,
         queue: &mut MessageQueue,
         source_issi: u32,
         dest_ssi: u32,
@@ -822,7 +981,23 @@ impl SdsBsSubentity {
     }
 
     /// Execute a system action triggered by an SDS U-STATUS command to ISSI 9999.
-    fn handle_sds_command_status(&mut self, _queue: &mut MessageQueue, source_ssi: u32, status: &PreCodedStatus) {
+    /// Send a short text reply as an SDS-TL simple-text message from `source_issi` to `dest_issi`.
+    /// Used by the U-STATUS info responder (FH-FEAT-014). Mirrors the SDS-TL framing used elsewhere:
+    /// [PID 0x82, message type 0x04, message reference, encoding 0x01 (ISO-8859-1), text…].
+    fn send_text_sds(&mut self, queue: &mut MessageQueue, source_issi: u32, dest_issi: u32, text: &str) {
+        static SDS_MR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        let mr = {
+            let v = SDS_MR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if v == 0 { SDS_MR.store(1, std::sync::atomic::Ordering::Relaxed); 1 } else { v }
+        };
+        let mut payload = vec![0x82u8, 0x04u8, mr, 0x01u8];
+        // Keep printable ASCII only (the encoding byte declares ISO-8859-1/ASCII).
+        payload.extend(text.bytes().filter(|&b| b == b'\t' || (0x20..=0x7E).contains(&b)));
+        let len_bits = (payload.len() * 8) as u16;
+        self.send_d_sds_data(queue, source_issi, dest_issi, SsiType::Issi, SdsUserData::Type4(len_bits, payload));
+    }
+
+    fn handle_sds_command_status(&mut self, queue: &mut MessageQueue, source_ssi: u32, status: &PreCodedStatus) {
         let status_code = status.into_raw() as u16;
 
         let cfg = self.config.config();
@@ -870,6 +1045,29 @@ impl SdsBsSubentity {
             }
             "kick_all" => {
                 self.pending_actions.push(SdsPendingAction::KickAll);
+            }
+            // ── FH-FEAT-014: query the host and reply to the requester as an SDS ──
+            "ip" => {
+                let ip = crate::sys_telemetry::primary_ip().unwrap_or_else(|| "n/a".to_string());
+                self.send_text_sds(queue, 9999, source_ssi, &format!("Host IP: {ip}"));
+            }
+            "temp" => {
+                let temp = crate::sys_telemetry::cpu_temp_c()
+                    .map(|c| format!("{c:.1} C"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                self.send_text_sds(queue, 9999, source_ssi, &format!("Host temp: {temp}"));
+            }
+            "info" => {
+                let ip = crate::sys_telemetry::primary_ip().unwrap_or_else(|| "n/a".to_string());
+                let temp = crate::sys_telemetry::cpu_temp_c()
+                    .map(|c| format!("{c:.1}C"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                self.send_text_sds(
+                    queue,
+                    9999,
+                    source_ssi,
+                    &format!("FlowStation v{} | IP {} | {}", tetra_core::STACK_VERSION, ip, temp),
+                );
             }
             other => {
                 tracing::warn!("SDS-CMD: unknown action '{}' for status={}, ignoring", other, status_code);

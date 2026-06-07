@@ -198,3 +198,153 @@ fn test_dsetup_late_entry_throttle() {
         "Each re-sent D-SETUP should carry a fresh tx_reporter"
     );
 }
+
+/// Helper: build a U-SETUP SAP message for a P2P (individual) call to `called_issi`.
+fn build_u_setup_p2p_msg(calling_issi: u32, called_issi: u32) -> SapMsg {
+    let u_setup = USetup {
+        area_selection: 0,
+        hook_method_selection: false,
+        simplex_duplex_selection: false,
+        basic_service_information: BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: CommunicationType::P2p,
+            slots_per_frame: None,
+            speech_service: Some(0),
+        },
+        request_to_transmit_send_data: false,
+        call_priority: 0,
+        clir_control: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_ssi: Some(called_issi as u64),
+        called_party_short_number_address: None,
+        called_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    u_setup.to_bitbuf(&mut sdu).expect("Failed to serialize USetup");
+    sdu.seek(0);
+
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(calling_issi, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
+/// Count individual-call D-SETUP resends addressed to `ssi` on the MCCH (no chan_alloc).
+fn count_individual_dsetup_to(msgs: &[SapMsg], ssi: u32) -> usize {
+    msgs.iter()
+        .filter(|m| {
+            m.dest == TetraEntity::Mle
+                && matches!(&m.msg, SapMsgInner::LcmcMleUnitdataReq(p)
+                    if p.main_address.ssi == ssi && p.chan_alloc.is_none())
+        })
+        .count()
+}
+
+// Energy-Economy D-SETUP gate (clause 16.7): individual-call setup resends to a sleeping EE MS
+// are held for the MS's downlink monitoring window, with a bounded fallback (EE_DSETUP_FALLBACK_TS
+// ≈ 423 timeslots / ~105 frames) to the historical blind resend. The empirically-observed resend
+// cadence (initial + late-entry) fires several individual D-SETUPs to the called MS within the
+// fallback window (around frames 0/44/89), which the tests below rely on.
+
+/// A sleeping EE MS (monitoring window closed for the whole sub-fallback run) must NOT receive
+/// any D-SETUP resend — they are held for its window.
+#[test]
+fn test_dsetup_to_ee_ms_held_outside_monitoring_window() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+
+    let calling = 3000001;
+    let called = 2000002;
+    register_subscriber(&mut test, called, 9); // local registration -> local P2P (not Brew)
+
+    // Window = frame 1, offset 30, cycle 60: open only when multiframe_index % 60 == 30. The run
+    // below spans multiframe_index 0..~6, so the window is CLOSED for its entire duration.
+    test.config.state_write().ee_monitoring_windows.insert(called, (1, 30, 60));
+
+    test.submit_message(build_u_setup_p2p_msg(calling, called));
+    test.run_stack(Some(1));
+    test.dump_sinks(); // discard the initial (ungated) D-SETUP page
+
+    // ~100 frames (400 ts) — comfortably under the ~423 ts fallback, so any resend here is held.
+    test.run_stack(Some(400));
+    let held = count_individual_dsetup_to(&test.dump_sinks(), called);
+    assert_eq!(
+        held, 0,
+        "D-SETUP resends to an asleep EE MS must be held while its monitoring window is closed"
+    );
+}
+
+/// A non-EE MS (absent from the published window map) is always reachable — the gate must not
+/// suppress its D-SETUP resends.
+#[test]
+fn test_dsetup_to_non_ee_ms_resends_normally() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+
+    let calling = 3000001;
+    let called = 2000002;
+    register_subscriber(&mut test, called, 9);
+    // No ee_monitoring_windows entry for `called` -> not in EE -> always reachable.
+
+    test.submit_message(build_u_setup_p2p_msg(calling, called));
+    test.run_stack(Some(1));
+    test.dump_sinks(); // discard initial page
+
+    test.run_stack(Some(400));
+    let resends = count_individual_dsetup_to(&test.dump_sinks(), called);
+    assert!(
+        resends >= 1,
+        "D-SETUP resends to a non-EE MS must continue normally (gate inactive), got {resends}"
+    );
+}
+
+/// Bounded-fallback safety net: even if the granted window phase is wrong (window never opens),
+/// resends must resume once the setup has been pending longer than the fallback — so call setup
+/// is never worse than the historical blind resend.
+#[test]
+fn test_dsetup_ee_fallback_resends_after_timeout() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+
+    let calling = 3000001;
+    let called = 2000002;
+    register_subscriber(&mut test, called, 9);
+
+    // Window that never opens during the run (closed throughout) -> only the fallback can release.
+    test.config.state_write().ee_monitoring_windows.insert(called, (1, 30, 60));
+
+    test.submit_message(build_u_setup_p2p_msg(calling, called));
+    test.run_stack(Some(1));
+    test.dump_sinks(); // discard initial page
+
+    // Run well past the ~423 ts fallback (600 ts). Pre-fallback resends are held; once the fallback
+    // expires, resends resume on the MCCH despite the still-closed window.
+    test.run_stack(Some(600));
+    let resends = count_individual_dsetup_to(&test.dump_sinks(), called);
+    assert!(
+        resends >= 1,
+        "after the EE fallback expires, D-SETUP resends must resume (never worse than before), got {resends}"
+    );
+}

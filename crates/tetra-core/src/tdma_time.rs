@@ -121,6 +121,30 @@ impl TdmaTime {
         self.f == 18 && self.t == 4 - ((self.m + 1) % 4)
         // self.f == 18 && (self.m + self.t) % 4 == 3
     }
+
+    /// Monotonic multiframe index (0-based) across hyperframes: 60 multiframes per hyperframe.
+    /// Used for energy-economy monitoring-window scheduling.
+    pub fn multiframe_index(self) -> u32 {
+        (self.m as u32).saturating_sub(1) + (self.h as u32) * 60
+    }
+
+    /// True if this slot falls inside an energy-economy MS's downlink monitoring window, i.e. the
+    /// MS (granted `EnergySavingMode` Eg1..Eg7) is awake to receive on the MCCH at this instant.
+    ///
+    /// An EE MS monitors frame `monitoring_frame` (1..=18) in those multiframes where
+    /// `multiframe_index % cycle_len == monitoring_multiframe`, where `cycle_len = (Eg as u8) + 1`
+    /// (Eg1=2, Eg2=3, …). The check is independent of the timeslot, so the whole frame (all 4
+    /// timeslots) is "open" — this absorbs the 1-slot TX-ahead skew and CMCE→LLC→UMAC latency.
+    ///
+    /// Returns false for invalid parameters (`cycle_len == 0`, frame out of 1..=18) so a bad
+    /// published window never silently gates everything.
+    pub fn in_ee_monitoring_window(self, monitoring_frame: u8, monitoring_multiframe: u8, cycle_len: u8) -> bool {
+        if cycle_len == 0 || !(1..=18).contains(&monitoring_frame) {
+            return false;
+        }
+        self.f == monitoring_frame
+            && (self.multiframe_index() % cycle_len as u32) == monitoring_multiframe as u32
+    }
 }
 
 impl fmt::Display for TdmaTime {
@@ -185,5 +209,39 @@ mod tests {
         for time_int in -10000..10000 {
             assert_eq!(TdmaTime::from_int(time_int).diff(TdmaTime::from_int(0)), time_int);
         }
+    }
+
+    #[test]
+    fn test_ee_monitoring_window() {
+        // Eg1 (cycle_len 2): MS monitors frame 7 in even multiframes (index % 2 == 0).
+        let frame = 7u8;
+        let mframe = 0u8;
+        let cyc = 2u8;
+        // m=1 -> index 0 -> 0%2==0, frame 7 matches.
+        assert!(TdmaTime { h: 0, m: 1, f: 7, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+        // Same frame, all 4 timeslots open.
+        assert!(TdmaTime { h: 0, m: 1, f: 7, t: 4 }.in_ee_monitoring_window(frame, mframe, cyc));
+        // Wrong frame -> closed.
+        assert!(!TdmaTime { h: 0, m: 1, f: 8, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+        // m=2 -> index 1 -> 1%2==1 != 0 -> closed even on the right frame.
+        assert!(!TdmaTime { h: 0, m: 2, f: 7, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+        // m=3 -> index 2 -> 2%2==0 -> open again.
+        assert!(TdmaTime { h: 0, m: 3, f: 7, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+
+        // Hyperframe wrap: index = (m-1) + h*60. h=1,m=1 -> index 60 -> 60%2==0 -> open.
+        assert!(TdmaTime { h: 1, m: 1, f: 7, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+        // h=1,m=2 -> index 61 -> odd -> closed.
+        assert!(!TdmaTime { h: 1, m: 2, f: 7, t: 1 }.in_ee_monitoring_window(frame, mframe, cyc));
+
+        // Eg3 (cycle_len 4), multiframe offset 2: open when index % 4 == 2.
+        let cyc3 = 4u8;
+        assert!(TdmaTime { h: 0, m: 3, f: 5, t: 1 }.in_ee_monitoring_window(5, 2, cyc3)); // index 2
+        assert!(!TdmaTime { h: 0, m: 4, f: 5, t: 1 }.in_ee_monitoring_window(5, 2, cyc3)); // index 3
+        assert!(TdmaTime { h: 0, m: 7, f: 5, t: 1 }.in_ee_monitoring_window(5, 2, cyc3)); // index 6 -> 6%4==2
+
+        // Invalid params never gate (return false).
+        assert!(!TdmaTime { h: 0, m: 1, f: 7, t: 1 }.in_ee_monitoring_window(7, 0, 0)); // cycle_len 0
+        assert!(!TdmaTime { h: 0, m: 1, f: 7, t: 1 }.in_ee_monitoring_window(0, 0, 2)); // frame 0
+        assert!(!TdmaTime { h: 0, m: 1, f: 7, t: 1 }.in_ee_monitoring_window(19, 0, 2)); // frame 19
     }
 }

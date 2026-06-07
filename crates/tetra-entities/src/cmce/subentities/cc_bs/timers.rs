@@ -38,17 +38,38 @@ impl CcBsSubentity {
             for task in tasks {
                 match task {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
-                        // Get our cached D-SETUP, build a prim and send it down the stack
-                        let Some(cached) = self.cached_setups.get_mut(&call_id) else {
-                            tracing::trace!(
-                                "CMCE: skipping D-SETUP resend for call_id={} (no cached D-SETUP; likely Brew-routed individual call)",
-                                call_id
-                            );
-                            continue;
+                        // Peek at routing info first (immutable) so the EE gate — a `&self` method —
+                        // can run before we take the mutable borrow on the cached D-SETUP below.
+                        let (dest_addr, is_individual, resend) = match self.cached_setups.get(&call_id) {
+                            Some(c) => (c.dest_addr, c.is_individual, c.resend),
+                            None => {
+                                tracing::trace!(
+                                    "CMCE: skipping D-SETUP resend for call_id={} (no cached D-SETUP; likely Brew-routed individual call)",
+                                    call_id
+                                );
+                                continue;
+                            }
                         };
-                        if !cached.resend {
+                        if !resend {
                             continue;
                         }
+                        // Energy-Economy gate (clause 16.7): hold an individual-call D-SETUP resend
+                        // until the called MS's downlink monitoring window opens, so the page lands
+                        // when the radio is actually listening. The bounded fallback inside
+                        // `ee_dsetup_blocks` reverts to the blind resend after EE_DSETUP_FALLBACK_TS,
+                        // so a wrong granted window phase is never worse than the historical behaviour.
+                        if is_individual && self.ee_dsetup_blocks(call_id, dest_addr.ssi) {
+                            tracing::debug!(
+                                "EE: holding D-SETUP resend for {} (call_id {}) until its monitoring window",
+                                dest_addr.ssi, call_id
+                            );
+                            continue;
+                        }
+                        // Now take the mutable borrow to apply the late-entry grant tweak and serialize.
+                        let cached = self
+                            .cached_setups
+                            .get_mut(&call_id)
+                            .expect("cached D-SETUP present (peeked above)");
                         // Late-entry D-SETUP keeps listeners attached to an established group call.
                         // During hangtime there is no current speaker, but sending NotGranted makes
                         // some terminals treat PTT as denied. Keep them in listener state and allow
@@ -57,8 +78,6 @@ impl CcBsSubentity {
                             cached.pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
                             cached.pdu.transmission_request_permission = false;
                         }
-                        let dest_addr = cached.dest_addr;
-                        let is_individual = cached.is_individual;
                         if is_individual {
                             // P2P individual call in setup phase: resend DSetup on MCCH
                             // (no chan_alloc, no circuit open yet). The called MS may be
@@ -208,6 +227,34 @@ impl CcBsSubentity {
         }
     }
 
+    /// Energy-Economy monitoring-window gate for an individual-call D-SETUP resend (clause 16.7).
+    ///
+    /// Returns `true` when the called MS (`dest_ssi`) is under Energy Economy and its downlink
+    /// monitoring window is currently closed, so the resend should be held until the window opens.
+    /// Returns `false` — i.e. send now — when the MS is not in EE (absent from the published map),
+    /// when its window is open, or once setup has been pending longer than `EE_DSETUP_FALLBACK_TS`
+    /// (the bounded fallback: a wrong granted window phase degrades to the historical blind resend
+    /// rather than blocking setup until it times out unanswered).
+    fn ee_dsetup_blocks(&self, call_id: u16, dest_ssi: u32) -> bool {
+        let window_closed = {
+            let state = self.config.state_read();
+            match state.ee_monitoring_windows.get(&dest_ssi) {
+                Some(&(frame, mframe, cycle_len)) => {
+                    !self.dltime.in_ee_monitoring_window(frame, mframe, cycle_len)
+                }
+                None => false, // not in energy economy — always reachable
+            }
+        };
+        if !window_closed {
+            return false;
+        }
+        // Bounded fallback: stop holding once setup has been pending too long.
+        match self.individual_calls.get(&call_id).and_then(|c| c.setup_timer_started) {
+            Some(started) => started.age(self.dltime) < EE_DSETUP_FALLBACK_TS,
+            None => false, // no setup clock to bound the wait — don't gate
+        }
+    }
+
     /// Release active calls when their configured call timeout expires.
     pub(super) fn check_call_timeout_expiry(&mut self, queue: &mut MessageQueue) {
         let expired_group_calls: Vec<u16> = self
@@ -249,11 +296,12 @@ impl CcBsSubentity {
         // EE DSetup retry: for P2P individual calls still in CallSetupPending state
         // (called MS has not yet sent U-ALERT), periodically retransmit DSetup on MCCH
         // so that a sleeping MS can receive it at its next monitoring window.
-        // Retry interval: 10 seconds (180 multiframes). This is long enough to not
-        // spam the called MS (which would block its PTT) but short enough to reach it
-        // within a few EE cycles before the 60s setup timeout.
-        // tick_start fires every multiframe (t==1 only), age is counted in frames.
-        const DSETUP_RETRY_INTERVAL_FRAMES: i32 = 180; // ~10 seconds at 18 frames/MF
+        // Retry interval ~2.5 s (180 timeslots; one slot = 170/12 ms, ~72 slots/s). Frequent enough
+        // that a retry instant has a good chance of coinciding with the called MS's EE monitoring
+        // window (the ee_dsetup_blocks gate below only lets a retry through when that window is open),
+        // yet bounded so we never flood the MS before the 60 s setup timeout.
+        // NOTE: TdmaTime::age()/diff() return TIMESLOTS (not frames) — locals are named accordingly.
+        const DSETUP_RETRY_INTERVAL_TS: i32 = 180; // ~2.5 s
         let retry_calls: Vec<u16> = self
             .individual_calls
             .iter()
@@ -262,9 +310,9 @@ impl CcBsSubentity {
                     return None;
                 }
                 let Some(started) = call.setup_timer_started else { return None; };
-                let age_frames = started.age(self.dltime);
-                // First retry after 1 full multiframe (~1s), then every 10s
-                if age_frames >= 18 && age_frames % DSETUP_RETRY_INTERVAL_FRAMES == 0 {
+                let age_ts = started.age(self.dltime);
+                // First retry after ~0.25 s, then every ~2.5 s.
+                if age_ts >= 18 && age_ts % DSETUP_RETRY_INTERVAL_TS == 0 {
                     Some(call_id)
                 } else {
                     None
@@ -275,13 +323,24 @@ impl CcBsSubentity {
         for call_id in retry_calls {
             let Some(cached) = self.cached_setups.get(&call_id) else { continue; };
             if !cached.is_individual { continue; }
+            let dest_addr = cached.dest_addr;
+            // Same Energy-Economy monitoring-window gate as the circuit_mgr resend path: while the
+            // called MS's window is closed, hold this retry (the bounded fallback inside
+            // `ee_dsetup_blocks` resumes it if the granted window phase turns out wrong). This is
+            // what actually aligns the retry to the MS's wake window instead of blind 10 s spamming.
+            if self.ee_dsetup_blocks(call_id, dest_addr.ssi) {
+                tracing::debug!(
+                    "EE: holding D-SETUP setup-retry for {} (call_id {}) until its monitoring window",
+                    dest_addr.ssi, call_id
+                );
+                continue;
+            }
             let mut sdu = BitBuffer::new_autoexpand(80);
             if cached.pdu.to_bitbuf(&mut sdu).is_err() { continue; }
             sdu.seek(0);
-            let dest_addr = cached.dest_addr;
             let prim = Self::build_sapmsg(sdu, None, dest_addr, Layer2Service::Unacknowledged, None);
             tracing::debug!(
-                "EE DSetup retry for call_id={} to ISSI {} (setup pending, MS may be sleeping)",
+                "EE DSetup retry for call_id={} to ISSI {} (setup pending, MS reachable)",
                 call_id, dest_addr.ssi
             );
             queue.push_back(prim);

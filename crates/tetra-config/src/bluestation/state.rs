@@ -187,6 +187,15 @@ pub struct StackState {
     /// (ETSI EN 300 392-2 §23.5). Empty when no calls are active, so idle delivery stays on
     /// the MCCH exactly as before.
     pub active_call_ts: std::collections::HashMap<u32, (u8, u8)>,
+
+    /// Per-MS energy-economy downlink monitoring window, republished every tick by MM from the
+    /// live client registry (so it is never stale). Keyed by ISSI; value = (monitoring_frame
+    /// 1..=18, monitoring_multiframe, cycle_len). Only MSs granted an actual energy-saving mode
+    /// (Eg1..Eg7, cycle_len >= 2) appear here — a StayAlive / unknown MS is ABSENT, which the
+    /// scheduler treats as "always reachable" (never gated). Used to defer unsolicited individual
+    /// downlink (incoming-call D-SETUP, SDS) until the MS is awake on its window
+    /// (ETSI EN 300 392-2 §16.7). Empty when no MS is in energy economy.
+    pub ee_monitoring_windows: std::collections::HashMap<u32, (u8, u8, u8)>,
 }
 
 #[cfg(test)]
@@ -285,6 +294,7 @@ impl Default for StackState {
             issi_whitelist_override: None,
             wx_override: None,
             active_call_ts: std::collections::HashMap::new(),
+            ee_monitoring_windows: std::collections::HashMap::new(),
         }
     }
 }

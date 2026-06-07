@@ -571,6 +571,17 @@ impl MmBs {
         }
     }
 
+    /// Rebuild StackState.ee_monitoring_windows from the live client registry. See the field doc
+    /// in tetra_config StackState and `MmClientMgr::ee_monitoring_windows`.
+    fn publish_monitoring_windows(&self) {
+        let map: std::collections::HashMap<u32, (u8, u8, u8)> = self
+            .client_mgr
+            .ee_monitoring_windows()
+            .map(|(issi, frame, mframe, cycle_len)| (issi, (frame, mframe, cycle_len)))
+            .collect();
+        self.config.state_write().ee_monitoring_windows = map;
+    }
+
     /// Decide which energy saving mode to grant an MS and compute its monitoring window.
     ///
     /// Per clause 16.7.1 NOTE 1 the BS may allocate a different mode than requested. We cap at
@@ -1437,6 +1448,12 @@ impl TetraEntityTrait for MmBs {
             // Mark as detached in state but keep in client_mgr (preserves ESM + groups)
             self.config.state_write().subscribers.deregister(issi);
         }
+
+        // Republish the per-MS energy-economy monitoring windows into shared state every tick, from
+        // the authoritative client registry, so the downlink scheduler (CMCE/SDS) can gate
+        // unsolicited traffic to a sleeping MS's wake window without reading stale data. Rebuilt
+        // wholesale (like CMCE's active_call_ts) — empty when no MS is in energy economy.
+        self.publish_monitoring_windows();
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

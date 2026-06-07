@@ -2,16 +2,23 @@ mod common;
 
 use std::time::Duration;
 
-use tetra_config::bluestation::{CfgBrew, StackMode};
+use tetra_config::bluestation::{CfgBrew, CfgSdsCommandControl, CfgSdsCommandEntry, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
+use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
 use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
+use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
+use tetra_pdus::cmce::pdus::u_disconnect::UDisconnect;
+use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_pdus::cmce::pdus::u_status::UStatus;
+use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::control::sds::CmceSdsData;
-use tetra_saps::lcmc::LcmcMleUnitdataInd;
+use tetra_saps::lcmc::{LcmcMleUnitdataInd, LcmcMleUnitdataReq};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 
 use crate::common::ComponentTest;
@@ -437,4 +444,364 @@ fn test_u_status_unregistered_dest_dropped() {
     let sink_msgs = test.dump_sinks();
     let d_status_count = count_d_sds_data(&sink_msgs);
     assert_eq!(d_status_count, 0, "Should not deliver D-STATUS when dest is not registered");
+}
+
+/// Build a U-SETUP for a group call from `calling_issi` to `dest_gssi`.
+fn build_u_setup_group_msg(calling_issi: u32, dest_gssi: u32) -> SapMsg {
+    let u_setup = USetup {
+        area_selection: 0,
+        hook_method_selection: false,
+        simplex_duplex_selection: false,
+        basic_service_information: BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: CommunicationType::P2Mp,
+            slots_per_frame: None,
+            speech_service: Some(0),
+        },
+        request_to_transmit_send_data: false,
+        call_priority: 0,
+        clir_control: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_ssi: Some(dest_gssi as u64),
+        called_party_short_number_address: None,
+        called_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    u_setup.to_bitbuf(&mut sdu).expect("Failed to serialize USetup");
+    sdu.seek(0);
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(calling_issi, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
+/// Build a U-DISCONNECT for `call_id` from the call owner, to release a group call.
+fn build_u_disconnect_msg(owner_issi: u32, call_id: u16) -> SapMsg {
+    let pdu = UDisconnect {
+        call_identifier: call_id,
+        disconnect_cause: DisconnectCause::UserRequestedDisconnection,
+        facility: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(48);
+    pdu.to_bitbuf(&mut sdu).expect("Failed to serialize UDisconnect");
+    sdu.seek(0);
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(owner_issi, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
+/// Count D-SDS-DATA (LcmcMleUnitdataReq to Mle) addressed to a specific ISSI.
+fn d_sds_to(msgs: &[SapMsg], issi: u32) -> Vec<&LcmcMleUnitdataReq> {
+    msgs.iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::LcmcMleUnitdataReq(p) if m.dest == TetraEntity::Mle && p.main_address.ssi == issi => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// FH-BUG-034 (final): the field radios do not accept an SDS in-band on the traffic channel
+/// (verified on-air against FACCH stealing with fragmentation, single-block STCH, and a full-slot
+/// SCH/F in the hangtime gap — the BS transmits all of them per ETSI, the radios receive none).
+/// They only accept an SDS on the MCCH. So an SDS to an in-call MS is DEFERRED and delivered on the
+/// MCCH once the call releases, which is acknowledged end-to-end.
+///
+/// This test drives the field scenario (ISSI talker of a group call) and asserts:
+///   (1) while the talker is in the call, the SDS is deferred (nothing addressed to it is emitted);
+///   (2) after the call releases, it is delivered on the MCCH (no stealing / no chan_alloc).
+#[test]
+fn test_sds_to_in_call_ms_is_deferred_then_delivered_on_mcch() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    let talker = 1000001;
+    let listener = 1000002;
+    let gssi = 100;
+
+    // A listener affiliated via the MM control path so the BS accepts the group call.
+    for action in [BrewSubscriberAction::Register, BrewSubscriberAction::Affiliate] {
+        test.submit_message(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi: listener, groups: vec![gssi], action }),
+        });
+        test.run_stack(Some(1));
+    }
+    // Talker registered for SDS routing (local delivery), keys up the group call (call_id starts at 4).
+    register_subscriber(&mut test, talker);
+    test.submit_message(build_u_setup_group_msg(talker, gssi));
+    test.run_stack(Some(2));
+    test.dump_sinks();
+
+    // Sanity: the talker is on a traffic timeslot.
+    assert!(
+        test.config.state_read().active_call_ts.contains_key(&talker),
+        "talker should be mapped onto a traffic timeslot while in the call"
+    );
+
+    // (1) SDS to the in-call talker -> deferred: nothing addressed to the talker is emitted.
+    test.submit_message(build_u_sds_data_msg(2000002, talker, 0x1234));
+    test.run_stack(Some(2));
+    let during = test.dump_sinks();
+    assert!(
+        d_sds_to(&during, talker).is_empty(),
+        "SDS to an in-call MS must be deferred (not transmitted) while the call is up"
+    );
+
+    // (2) Release the call (owner disconnects). The talker leaves active_call_ts and the deferred
+    // SDS is delivered on the MCCH.
+    test.submit_message(build_u_disconnect_msg(talker, 4));
+    test.run_stack(Some(3));
+    assert!(
+        !test.config.state_read().active_call_ts.contains_key(&talker),
+        "after release the talker must no longer be on a traffic timeslot"
+    );
+    let after = test.dump_sinks();
+    let delivered = d_sds_to(&after, talker);
+    assert!(!delivered.is_empty(), "deferred SDS must be delivered once the call releases");
+    assert!(
+        delivered.iter().all(|p| !p.stealing_permission && p.chan_alloc.is_none()),
+        "deferred SDS must be delivered on the MCCH (no FACCH stealing) after the call ends"
+    );
+}
+
+/// FH-BUG-036: an SDS deferred while its destination is BOTH in a (short) call AND an energy-economy
+/// MS is, after the call releases, delivered on the destination's next monitoring window — on the
+/// MCCH, never off-window — provided this happens within `SDS_DEFER_DEADLINE`. (Past the deadline the
+/// SDS fails cleanly instead, which is wall-clock-timed and covered by the field log rather than a
+/// unit test.)
+#[test]
+fn test_sds_to_in_call_ee_ms_waits_for_window_after_call() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+
+    let talker = 1000001; // the EE destination, also the group-call talker
+    let listener = 1000002;
+    let gssi = 100;
+
+    // Listener affiliated via MM control path so the BS accepts the group call.
+    for action in [BrewSubscriberAction::Register, BrewSubscriberAction::Affiliate] {
+        test.submit_message(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi: listener, groups: vec![gssi], action }),
+        });
+        test.run_stack(Some(1));
+    }
+    register_subscriber(&mut test, talker);
+
+    // Talker is an EE MS: monitoring window at frame 14, cycle 2 (Eg1-like). Frame 14 is clear of
+    // the frames the call setup/release pass through, so the window is shut across the release.
+    // (MM is absent from this test, so the published map is not overwritten.)
+    test.config.state_write().ee_monitoring_windows.insert(talker, (14, 0, 2));
+
+    // Talker keys up the group call (call_id starts at 4).
+    test.submit_message(build_u_setup_group_msg(talker, gssi));
+    test.run_stack(Some(2));
+    test.dump_sinks();
+    assert!(
+        test.config.state_read().active_call_ts.contains_key(&talker),
+        "talker should be on a traffic timeslot while in the call"
+    );
+
+    // SDS to the in-call EE talker -> deferred.
+    test.submit_message(build_u_sds_data_msg(2000002, talker, 0x1234));
+    test.run_stack(Some(2));
+    assert!(
+        d_sds_to(&test.dump_sinks(), talker).is_empty(),
+        "SDS to an in-call MS must be deferred while the call is up"
+    );
+
+    // Release the call. The talker leaves active_call_ts but its EE window is still shut.
+    test.submit_message(build_u_disconnect_msg(talker, 4));
+    test.run_stack(Some(3));
+    assert!(
+        !test.config.state_read().active_call_ts.contains_key(&talker),
+        "after release the talker must no longer be on a traffic timeslot"
+    );
+    // KEY (FH-BUG-036): the SDS must NOT be flushed off-window the instant the call ends — it waits
+    // for the EE monitoring window. (The window is shut at these frames.)
+    assert!(
+        d_sds_to(&test.dump_sinks(), talker).is_empty(),
+        "after call release with the window shut, the SDS must wait for the window, not go off-window"
+    );
+
+    // Advance until the monitoring window opens -> delivered on the MCCH (no FACCH stealing).
+    test.run_stack(Some(160));
+    let after = test.dump_sinks();
+    let delivered = d_sds_to(&after, talker);
+    assert!(
+        !delivered.is_empty(),
+        "deferred SDS must be delivered once the EE monitoring window opens after the call"
+    );
+    assert!(
+        delivered.iter().all(|p| !p.stealing_permission && p.chan_alloc.is_none()),
+        "EE-deferred SDS must be delivered on the MCCH"
+    );
+}
+
+/// FH-BUG-034 / EE compliance: an SDS to an energy-economy MS that is asleep outside its monitoring
+/// window must be DEFERRED until the window opens, then delivered on the MCCH — so the BS respects
+/// the MS's reduced monitoring schedule (ETSI EN 300 392-2 §16.7) instead of transmitting blindly.
+#[test]
+fn test_sds_to_ee_ms_defers_until_monitoring_window() {
+    debug::setup_logging_verbose();
+
+    // Start on frame 1, multiframe 1 (multiframe_index 0).
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    let dest = 2000001;
+    register_subscriber(&mut test, dest); // registered, idle (not in a call)
+
+    // Publish an EE monitoring window for dest: frame 2, multiframe offset 0, cycle_len 2. At the
+    // start (frame 1) the window is CLOSED; it opens when the downlink reaches frame 2.
+    // (MM is not in this test, so the published map is not overwritten.)
+    test.config.state_write().ee_monitoring_windows.insert(dest, (2, 0, 2));
+
+    // SDS arrives while dest is asleep (frame 1, window closed) -> must be deferred, not emitted.
+    test.submit_message(build_u_sds_data_msg(3000001, dest, 0xABCD));
+    test.run_stack(Some(2)); // still within frame 1
+    let during = test.dump_sinks();
+    assert!(
+        count_d_sds_data(&during) == 0,
+        "SDS to an asleep EE MS must be deferred (not transmitted) outside its monitoring window"
+    );
+
+    // Advance to the MS's monitoring window (frame 2). The deferred SDS must now be delivered on
+    // the MCCH (no stealing).
+    test.run_stack(Some(10));
+    let after = test.dump_sinks();
+    let delivered: Vec<&LcmcMleUnitdataReq> = after
+        .iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::LcmcMleUnitdataReq(p) if m.dest == TetraEntity::Mle && p.main_address.ssi == dest => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert!(!delivered.is_empty(), "deferred SDS must be delivered once the EE monitoring window opens");
+    assert!(
+        delivered.iter().all(|p| !p.stealing_permission && p.chan_alloc.is_none()),
+        "EE-deferred SDS must be delivered on the MCCH"
+    );
+}
+
+/// Helper: build a U-STATUS SAP message from `src` to `dest` carrying a pre-coded status value.
+fn build_u_status_msg(src: u32, dest: u32, status: u16) -> SapMsg {
+    let u_status = UStatus {
+        area_selection: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_short_number_address: None,
+        called_party_ssi: Some(dest as u64),
+        called_party_extension: None,
+        pre_coded_status: PreCodedStatus::from(status),
+        external_subscriber_number: None,
+        dm_ms_address: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    u_status.to_bitbuf(&mut sdu).expect("Failed to serialize U-STATUS");
+    sdu.seek(0);
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(src, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
+/// FH-FEAT-014: an authorized ISSI sending a U-STATUS to 9999 whose status code maps to the "ip"
+/// action gets a text-SDS reply addressed back to it.
+#[test]
+fn test_u_status_command_ip_replies_to_authorized() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.sds_command_control = Some(CfgSdsCommandControl {
+        authorized_issis: vec![1000001],
+        commands: vec![CfgSdsCommandEntry { status_code: 50, action: "ip".to_string() }],
+    });
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, 1000001);
+
+    test.submit_message(build_u_status_msg(1000001, 9999, 50));
+    test.run_stack(Some(2));
+
+    let after = test.dump_sinks();
+    let reply = d_sds_to(&after, 1000001);
+    assert!(
+        !reply.is_empty(),
+        "authorized U-STATUS (action=ip) to 9999 must produce an SDS reply to the requester"
+    );
+}
+
+/// FH-FEAT-014: a U-STATUS from an ISSI that is NOT in authorized_issis must be ignored — no reply.
+#[test]
+fn test_u_status_command_unauthorized_no_reply() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.sds_command_control = Some(CfgSdsCommandControl {
+        authorized_issis: vec![1000001], // 1000002 is NOT authorized
+        commands: vec![CfgSdsCommandEntry { status_code: 50, action: "ip".to_string() }],
+    });
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, 1000002);
+
+    test.submit_message(build_u_status_msg(1000002, 9999, 50));
+    test.run_stack(Some(2));
+
+    let after = test.dump_sinks();
+    assert!(
+        d_sds_to(&after, 1000002).is_empty(),
+        "unauthorized U-STATUS to 9999 must be ignored (no reply)"
+    );
 }

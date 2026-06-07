@@ -1016,6 +1016,14 @@ impl CcBsSubentity {
         // Group calls: every affiliated member is camped on the group's assigned traffic slot.
         for call in self.active_calls.values() {
             map.insert(call.dest_gssi, (call.ts, call.usage));
+            // Also map the current/last speaker's ISSI directly. The speaker is the one
+            // individual we KNOW is camped on this traffic slot (it just transmitted), and an
+            // SDS addressed to it by ISSI would otherwise fail the GSSI lookup above and fall
+            // back to per-MS group affiliation — which a talker often does NOT have (keying up
+            // a group is not the same as an MM group attachment). Without this, an SDS to the
+            // active talker of a group call is sent on the MCCH it is no longer monitoring and
+            // is never received. (FH-BUG-034 follow-up.)
+            map.insert(call.source_issi, (call.ts, call.usage));
         }
         // Individual calls: only once connected (Active) are the parties on a traffic channel.
         // During setup/alerting they are still reachable on the MCCH, so leave them out.

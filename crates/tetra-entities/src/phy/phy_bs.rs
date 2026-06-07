@@ -269,7 +269,10 @@ impl<D: RxTxDev> PhyBs<D> {
                 if rx_slot.subslot1.train_type != TrainingSequence::NotFound {
                     tracing::info!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot1", rx_slot.subslot1.train_type);
                     if slot_sent {
-                        tracing::warn!("Sending same burst twice to LMAC");
+                        // Expected: more than one of {full-slot, subslot1, subslot2} correlated a
+                        // training sequence in this slot — usually a false-positive detection. We
+                        // forward all candidates; the LMAC CRC discards the bogus ones. Not an error.
+                        tracing::debug!("Multiple candidate bursts detected in one slot; forwarding all (LMAC CRC drops false positives)");
                     }
                     if let Some(ul_rx_sender) = &self.ul_rx_sender {
                         // Log received data to file (non-blocking)
@@ -282,7 +285,10 @@ impl<D: RxTxDev> PhyBs<D> {
                 if rx_slot.subslot2.train_type != TrainingSequence::NotFound {
                     tracing::info!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot2", rx_slot.subslot2.train_type);
                     if slot_sent {
-                        tracing::warn!("Sending same burst twice to LMAC");
+                        // Expected: more than one of {full-slot, subslot1, subslot2} correlated a
+                        // training sequence in this slot — usually a false-positive detection. We
+                        // forward all candidates; the LMAC CRC discards the bogus ones. Not an error.
+                        tracing::debug!("Multiple candidate bursts detected in one slot; forwarding all (LMAC CRC drops false positives)");
                     }
                     if let Some(ul_rx_sender) = &self.ul_rx_sender {
                         // Log received data to file (non-blocking)

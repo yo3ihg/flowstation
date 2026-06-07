@@ -23,6 +23,14 @@ fn setup_timeout_to_timeslots(timeout: CallTimeoutSetupPhase) -> Option<i32> {
     }
 }
 
+/// Energy-Economy D-SETUP gate (clause 16.7): individual-call setup resends are held for the
+/// called MS's monitoring window, but if the window has not opened within this many timeslots of
+/// setup start we fall back to the historical blind resend. ~6 s (a few EE cycles) — chosen to be
+/// comfortably under the shortest setup timeout (`T10s`/`Predefined`) so a wrong granted window
+/// phase degrades to "no worse than before", never to a setup that times out unanswered.
+/// (6 s / (170/12 ms per slot) ≈ 423 timeslots.)
+pub(super) const EE_DSETUP_FALLBACK_TS: i32 = 423;
+
 #[inline]
 pub(super) fn call_timeout_to_timeslots(timeout: CallTimeout) -> Option<i32> {
     match timeout {
